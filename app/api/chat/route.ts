@@ -212,9 +212,12 @@ export async function POST(request: Request) {
           enqueue({ type: "done" });
           controller.close();
         } catch (err) {
+          const msg = err instanceof Error ? err.message : "Unknown error";
+          const errType = err?.constructor?.name ?? "UnknownError";
+          const keyPresent = !!process.env.ANTHROPIC_API_KEY;
           enqueue({
             type: "error",
-            message: err instanceof Error ? err.message : "Unknown error",
+            message: `${errType}: ${msg} | key_present=${keyPresent}`,
           });
           controller.close();
         }

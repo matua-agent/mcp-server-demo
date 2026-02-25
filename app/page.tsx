@@ -363,7 +363,7 @@ export default function Home() {
           <span className="text-[var(--border)]">·</span>
           <span className="text-xs font-mono text-[var(--text-muted)]">5 tools registered</span>
           <span className="text-[var(--border)]">·</span>
-          <span className="text-xs font-mono text-[var(--text-muted)]">claude-3-5-haiku</span>
+          <span className="text-xs font-mono text-[var(--text-muted)]">claude-haiku-4-5</span>
         </div>
         <div className="flex items-center gap-3">
           {(sessionTokens.in > 0 || sessionTokens.out > 0) && (

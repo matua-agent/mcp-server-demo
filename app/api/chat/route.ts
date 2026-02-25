@@ -102,7 +102,7 @@ export async function POST(request: Request) {
 
             // Non-streaming call to get structured tool use decisions
             const response = await client.messages.create({
-              model: "claude-haiku-4-5",
+              model: "claude-3-5-haiku-20241022",
               max_tokens: 2048,
               system: SYSTEM_PROMPT,
               tools: anthropicTools,

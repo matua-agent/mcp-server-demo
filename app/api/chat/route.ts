@@ -1,12 +1,10 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { TOOLS, executeTool } from "@/lib/tools";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY!;
+const ANTHROPIC_BASE = "https://api.anthropic.com/v1/messages";
 
 const SYSTEM_PROMPT = `You are a helpful AI assistant with access to real tools via the Model Context Protocol (MCP).
 
@@ -23,18 +21,45 @@ After using tools, synthesize the results into a clear, conversational response.
 
 The user is watching the MCP protocol trace in real-time. They can see every tool call and response. Your tool usage IS the demonstration.`;
 
-// Stream event encoding
+type AnthropicTool = {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+};
+
+type AnthropicMessage = {
+  role: "user" | "assistant";
+  content: string | unknown[];
+};
+
+async function callAnthropic(messages: AnthropicMessage[], tools: AnthropicTool[]) {
+  const res = await fetch(ANTHROPIC_BASE, {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-3-5-haiku-20241022",
+      max_tokens: 2048,
+      system: SYSTEM_PROMPT,
+      tools,
+      messages,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Anthropic API ${res.status}: ${err}`);
+  }
+
+  return res.json();
+}
+
 function encodeEvent(event: object): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(event) + "\n");
 }
-
-type MCPTraceEvent =
-  | { type: "initialize"; request: object; response: object }
-  | { type: "tools_list"; tools: object[] }
-  | { type: "tool_call"; callId: string; name: string; arguments: object }
-  | { type: "tool_result"; callId: string; name: string; result: object; isError: boolean; durationMs: number }
-  | { type: "assistant_message"; inputTokens: number; outputTokens: number }
-  | { type: "thinking"; text: string };
 
 export async function POST(request: Request) {
   try {
@@ -50,9 +75,7 @@ export async function POST(request: Request) {
         try {
           // ─── MCP Phase 1: Initialize ─────────────────────────
           const initRequest = {
-            jsonrpc: "2.0",
-            id: 1,
-            method: "initialize",
+            jsonrpc: "2.0", id: 1, method: "initialize",
             params: {
               protocolVersion: "2024-11-05",
               capabilities: { tools: {}, roots: {} },
@@ -60,34 +83,27 @@ export async function POST(request: Request) {
             },
           };
           const initResponse = {
-            jsonrpc: "2.0",
-            id: 1,
+            jsonrpc: "2.0", id: 1,
             result: {
               protocolVersion: "2024-11-05",
               capabilities: { tools: { listChanged: false } },
               serverInfo: { name: "mcp-server-demo", version: "1.0.0" },
             },
           };
-          const traceInit: MCPTraceEvent = { type: "initialize", request: initRequest, response: initResponse };
-          enqueue({ type: "trace", event: traceInit });
+          enqueue({ type: "trace", event: { type: "initialize", request: initRequest, response: initResponse } });
 
           // ─── MCP Phase 2: List Tools ─────────────────────────
-          const toolsListRequest = { jsonrpc: "2.0", id: 2, method: "tools/list" };
-          const toolsListResponse = { jsonrpc: "2.0", id: 2, result: { tools: TOOLS } };
-          const traceList: MCPTraceEvent = { type: "tools_list", tools: TOOLS };
-          enqueue({ type: "trace", event: traceList });
-
-          // Brief delay to make the trace feel live
+          enqueue({ type: "trace", event: { type: "tools_list", tools: TOOLS } });
           await new Promise((r) => setTimeout(r, 150));
 
           // ─── MCP Phase 3: Agentic Tool Loop ─────────────────
-          const anthropicTools: Anthropic.Tool[] = TOOLS.map((t) => ({
+          const anthropicTools: AnthropicTool[] = TOOLS.map((t) => ({
             name: t.name,
             description: t.description,
-            input_schema: t.inputSchema as Anthropic.Tool["input_schema"],
+            input_schema: t.inputSchema as Record<string, unknown>,
           }));
 
-          const conversationMessages: Anthropic.MessageParam[] = messages.map(
+          const conversationMessages: AnthropicMessage[] = messages.map(
             (m: { role: string; content: string }) => ({
               role: m.role as "user" | "assistant",
               content: m.content,
@@ -100,41 +116,32 @@ export async function POST(request: Request) {
           while (continueLoop && callCount < 8) {
             callCount++;
 
-            // Non-streaming call to get structured tool use decisions
-            const response = await client.messages.create({
-              model: "claude-3-5-haiku-20241022",
-              max_tokens: 2048,
-              system: SYSTEM_PROMPT,
-              tools: anthropicTools,
-              messages: conversationMessages,
-            });
+            const response = await callAnthropic(conversationMessages, anthropicTools);
 
             // Log token usage
             enqueue({
               type: "trace",
               event: {
                 type: "assistant_message",
-                inputTokens: response.usage.input_tokens,
-                outputTokens: response.usage.output_tokens,
+                inputTokens: response.usage?.input_tokens ?? 0,
+                outputTokens: response.usage?.output_tokens ?? 0,
                 stopReason: response.stop_reason,
               },
             });
 
-            // Collect text and tool calls from this response
-            const toolCalls: Anthropic.ToolUseBlock[] = [];
+            const toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
             let textContent = "";
 
-            for (const block of response.content) {
+            for (const block of response.content ?? []) {
               if (block.type === "text") {
                 textContent += block.text;
               } else if (block.type === "tool_use") {
-                toolCalls.push(block);
+                toolCalls.push({ id: block.id, name: block.name, input: block.input });
               }
             }
 
-            // Stream any text content
+            // Stream text word by word
             if (textContent) {
-              // Stream text word by word for visual effect
               const words = textContent.split(" ");
               for (const word of words) {
                 enqueue({ type: "text", content: word + " " });
@@ -142,49 +149,33 @@ export async function POST(request: Request) {
               }
             }
 
-            // Process tool calls
             if (toolCalls.length === 0 || response.stop_reason === "end_turn") {
               continueLoop = false;
               break;
             }
 
-            // Add assistant's response to conversation
-            conversationMessages.push({
-              role: "assistant",
-              content: response.content,
-            });
+            // Add assistant response to history
+            conversationMessages.push({ role: "assistant", content: response.content });
 
-            // Execute each tool call
-            const toolResults: Anthropic.ToolResultBlockParam[] = [];
+            // Execute tools
+            const toolResults: unknown[] = [];
 
             for (const toolCall of toolCalls) {
-              const callId = toolCall.id;
-              const toolName = toolCall.name;
-              const toolArgs = toolCall.input as Record<string, unknown>;
-
-              // Emit tool call trace
               enqueue({
                 type: "trace",
-                event: {
-                  type: "tool_call",
-                  callId,
-                  name: toolName,
-                  arguments: toolArgs,
-                },
+                event: { type: "tool_call", callId: toolCall.id, name: toolCall.name, arguments: toolCall.input },
               });
 
-              // Execute the tool
               const startTime = Date.now();
-              const result = await executeTool(toolName, toolArgs);
+              const result = await executeTool(toolCall.name, toolCall.input);
               const durationMs = Date.now() - startTime;
 
-              // Emit tool result trace
               enqueue({
                 type: "trace",
                 event: {
                   type: "tool_result",
-                  callId,
-                  name: toolName,
+                  callId: toolCall.id,
+                  name: toolCall.name,
                   result,
                   isError: result.isError ?? false,
                   durationMs,
@@ -193,32 +184,22 @@ export async function POST(request: Request) {
 
               toolResults.push({
                 type: "tool_result",
-                tool_use_id: callId,
+                tool_use_id: toolCall.id,
                 content: result.content,
                 is_error: result.isError,
               });
 
-              // Small delay between tool executions for visual clarity
               await new Promise((r) => setTimeout(r, 80));
             }
 
-            // Add tool results to conversation
-            conversationMessages.push({
-              role: "user",
-              content: toolResults,
-            });
+            conversationMessages.push({ role: "user", content: toolResults });
           }
 
           enqueue({ type: "done" });
           controller.close();
         } catch (err) {
           const msg = err instanceof Error ? err.message : "Unknown error";
-          const errType = err?.constructor?.name ?? "UnknownError";
-          const keyPresent = !!process.env.ANTHROPIC_API_KEY;
-          enqueue({
-            type: "error",
-            message: `${errType}: ${msg} | key_present=${keyPresent}`,
-          });
+          enqueue({ type: "error", message: msg });
           controller.close();
         }
       },
